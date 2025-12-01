@@ -4,289 +4,361 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# --- 1. НАСТРОЙКИ СТРАНИЦЫ ---
+# ==========================================
+# 1. НАСТРОЙКИ И КОНФИГУРАЦИЯ
+# ==========================================
 st.set_page_config(
-    page_title="Syndicate Odds Analyst",
-    page_icon="👁️",
+    page_title="Syndicate Odds Analyst (Final)",
+    page_icon="💎",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- 2. БОКОВАЯ ПАНЕЛЬ ---
+# --- БОКОВАЯ ПАНЕЛЬ ---
 with st.sidebar:
     st.header("⚙️ Банк и Риск")
     BANKROLL = st.number_input("Ваш Банк ($)", value=1000, step=100)
     KELLY_FRACTION = st.slider("Дробный Келли (Сила ставки)", 0.1, 0.5, 0.3, 0.05)
-    st.info(f"Режим: {int(KELLY_FRACTION*100)}% от полного Келли")
     
     st.divider()
-    st.markdown("### 📊 Легенда Рейтингов")
-    st.markdown("💎 **S+** (Diamond) - Идеал. Пиннакл падает, маржа растет, Азиаты подтверждают.")
-    st.markdown("🟢 **A** (Strong) - Хороший тренд или огромный валуй.")
-    st.markdown("🟡 **B** (Risky) - Валуй есть, но Пиннакл сомневается (защита).")
-    st.markdown("🔴 **C** (Trash) - Нет валуя или ловушка.")
+    st.markdown("### 🧠 КАК ЧИТАТЬ ГРАФИКИ")
+    st.markdown("📉 **Цена (Odds) падает**: Вероятность растет.")
+    st.markdown("📈 **Риск (R) растет**: Букмекер нагружает исход.")
+    st.markdown("✅ **СИГНАЛ**: Линии идут в разные стороны (Крест).")
 
-# --- 3. МОЩНЫЕ ПАРСЕРЫ ---
+# ==========================================
+# 2. МАТЕМАТИЧЕСКОЕ ЯДРО (R-MODEL)
+# ==========================================
 
-def parse_pinnacle_full(raw_text):
+def calculate_r_metrics_universal(history_data, mode="3way"):
     """
-    Парсит Home/Draw/Away и вычисляет Payout (Маржу) для каждой точки.
+    Считает Private Margin (PM) и Risk (R) для любого кол-ва исходов.
     """
+    if not history_data: return None
+    processed = []
+    base_pm = None 
+    
+    for row in history_data:
+        odds = row['odds'] # Список кэфов
+        
+        # 1. Считаем Имплицитную вероятность (Implied Probability)
+        implied = [1/k for k in odds]
+        sum_imp = sum(implied)
+        
+        # 2. Десятичная маржа
+        margin_dec = sum_imp - 1
+        
+        # 3. Private Margin (PM) - распределение маржи
+        pm = [(margin_dec * (i / sum_imp)) for i in implied]
+        
+        row['pm'] = pm
+        
+        # 4. R-Migration (Изменение риска относительно открытия)
+        if base_pm is None:
+            base_pm = pm
+            row['r'] = [0.0] * len(odds)
+        else:
+            r_values = []
+            for i in range(len(odds)):
+                base_val = base_pm[i]
+                curr_val = pm[i]
+                # Защита от деления на 0
+                val = ((curr_val - base_val) / base_val * 100) if base_val != 0 else 0
+                r_values.append(val)
+            row['r'] = r_values
+            
+        processed.append(row)
+    return processed
+
+def calculate_kelly_stake(odds, fair_prob, bank, frac):
+    """Калькулятор Келли"""
+    b = odds - 1
+    p = fair_prob
+    q = 1 - p
+    f = (b * p - q) / b
+    return max(0, round(f * frac * bank, 2))
+
+# ==========================================
+# 3. УМНЫЕ ПАРСЕРЫ (CLEANERS)
+# ==========================================
+
+def parse_pinnacle_universal(raw_text):
     data = []
     lines = raw_text.strip().split('\n')
     current_year = datetime.now().year
+    mode = "unknown"
     
     for line in lines:
-        parts = re.split(r'\s+', line.strip())
-        # Нужно минимум 3 кэфа + время
-        if len(parts) >= 5:
+        # Пропускаем закрытые линии
+        if "Closed" in line: continue
+        
+        # --- ОЧИСТКА ДАННЫХ ---
+        # Удаляем слова Early, Live, HT, FT
+        clean_line = re.sub(r'(Early|Live|HT|FT)', '', line, flags=re.IGNORECASE)
+        # Удаляем счет (1-0, 2-1) и минуты (87')
+        clean_line = re.sub(r'\d+-\d+', '', clean_line)
+        clean_line = re.sub(r"\d+'", '', clean_line)
+        
+        parts = re.split(r'\s+', clean_line.strip())
+        
+        if len(parts) >= 2:
             try:
-                # Пробуем найти 3 кэфа подряд (1X2)
-                # Обычно они идут в начале: 1.83 3.82 4.41
-                h, d, a = float(parts[0]), float(parts[1]), float(parts[2])
+                nums = []
+                for p in parts:
+                    # Чистим от u/o (under/over)
+                    clean_p = p.lower().replace('u','').replace('o','')
+                    
+                    # Если есть слеш (2/2.5) - это линия, пропускаем
+                    if '/' in clean_p: continue 
+                        
+                    if clean_p.replace('.','').isdigit():
+                        val = float(clean_p)
+                        # Фильтр кэфов (от 1.01 до 100)
+                        if 1.01 <= val <= 100.0:
+                            nums.append(val)
                 
-                # Расчет Payout (Теоретический возврат)
-                # Формула: 1 / (1/H + 1/D + 1/A) * 100
-                margin_sum = (1/h) + (1/d) + (1/a)
-                payout = (1 / margin_sum) * 100
+                final_odds = []
                 
-                # Парсим время
-                date_str = f"{parts[-2]} {parts[-1]}"
-                full_date_str = f"{current_year}-{date_str}"
-                dt_obj = datetime.strptime(full_date_str, "%Y-%d-%m %H:%M")
-                
-                data.append({
-                    "h": h, "d": d, "a": a,
-                    "payout": payout,
-                    "dt": dt_obj,
-                    "time_str": date_str
-                })
-            except (ValueError, IndexError):
-                continue
+                # --- ЛОГИКА ОПРЕДЕЛЕНИЯ ТИПА (1X2 или TOTALS) ---
+                if len(nums) == 3:
+                    # Считаем сумму вероятностей
+                    imp_sum = sum([1/n for n in nums])
+                    
+                    # Если сумма > 1.25 (Маржа > 25%), значит среднее число - это ЛИНИЯ (напр. 2.5), а не кэф
+                    if imp_sum > 1.25:
+                        final_odds = [nums[0], nums[2]] # Берем края
+                        mode = "2way"
+                    else:
+                        final_odds = nums # Берем все 3 (1X2)
+                        mode = "3way"
+                        
+                elif len(nums) == 2:
+                    final_odds = nums
+                    mode = "2way"
+                    
+                elif len(nums) > 3:
+                     # Если куча чисел, берем 1-е и последнее (края), предполагая 2-way
+                     final_odds = [nums[0], nums[-1]]
+                     mode = "2way"
+
+                if final_odds:
+                    # --- ПАРСИНГ ВРЕМЕНИ ---
+                    # Ищем время (12:11)
+                    date_match = re.search(r'\d{1,2}:\d{2}', line)
+                    time_str = date_match.group(0) if date_match else "00:00"
+                    
+                    # Ищем дату (25/11)
+                    day_match = re.search(r'\d{1,2}/\d{1,2}', line)
+                    day_str = day_match.group(0) if day_match else datetime.now().strftime("%d/%m")
+                    
+                    full_date_str = f"{current_year}-{day_str.replace('/','-')} {time_str}"
+                    
+                    try:
+                        dt_obj = datetime.strptime(full_date_str, "%Y-%d-%m %H:%M")
+                    except:
+                        dt_obj = datetime.now()
+
+                    data.append({
+                        "odds": final_odds,
+                        "dt": dt_obj,
+                        "time_str": f"{day_str} {time_str}"
+                    })
+            except: continue
 
     if not data: return None
-    
-    # Сортируем от старого к новому
+    # Сортируем от старых к новым
     data.sort(key=lambda x: x['dt'])
+    
+    # Считаем R-метрики
+    data = calculate_r_metrics_universal(data, mode)
+    
+    # Считаем % изменения первого кэфа (Home или Over)
+    move_pct = (data[-1]['odds'][0] - data[0]['odds'][0]) / data[0]['odds'][0] * 100
     
     return {
         "open": data[0],
         "current": data[-1],
         "history": data,
-        "move_pct": (data[-1]['h'] - data[0]['h']) / data[0]['h'] * 100,
-        "payout_diff": data[-1]['payout'] - data[0]['payout']
+        "move_pct": move_pct,
+        "mode": mode
     }
 
-def parse_market(raw_text):
-    asians = []
-    softs = []
-    asian_names = ['sbobet', '188bet', '12bet', 'mansion88', 'singbet', 'ibcbet', 'crown']
-    
+def parse_market_universal(raw_text):
+    """Простой парсер для софтов"""
+    targets = []
     lines = raw_text.strip().split('\n')
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        if not line: 
-            i += 1
-            continue
+        # Пропускаем пустые и цифры
+        if not line or line[0].isdigit(): 
+            i += 1; continue
             
-        if not line[0].isdigit(): # Имя БК
-            bookie_name = line
-            if i + 2 < len(lines):
-                try:
-                    curr_parts = re.split(r'\s+', lines[i+1].strip())
-                    open_parts = re.split(r'\s+', lines[i+2].strip())
-                    
-                    if curr_parts[0].replace('.','').isdigit():
-                        curr_h = float(curr_parts[0])
-                        open_h = float(open_parts[0])
-                        
-                        entry = {
-                            "name": bookie_name,
-                            "current": curr_h,
-                            "move_pct": (curr_h - open_h) / open_h * 100
-                        }
-                        
-                        if any(x in bookie_name.lower() for x in asian_names):
-                            asians.append(entry)
-                        elif "pinnacle" not in bookie_name.lower():
-                            softs.append(entry)
-                    i += 3
-                except: i += 1
-            else: i += 1
+        name = line
+        if i+1 < len(lines):
+            try:
+                # Ищем кэфы в следующей строке
+                parts = re.split(r'\s+', lines[i+1])
+                nums = [float(p) for p in parts if p.replace('.','').isdigit()]
+                
+                if nums:
+                    # Берем первый кэф (Home или Over) для сравнения
+                    targets.append({"name": name, "odds": nums[0]}) 
+                i += 2 
+            except: i += 1
         else: i += 1
-    return {"asians": asians, "softs": softs}
+    return {"softs": targets}
 
-def calculate_kelly(odds, fair_prob, bankroll, fraction):
-    b = odds - 1
-    p = fair_prob
-    q = 1 - p
-    f = (b * p - q) / b
-    if f <= 0: return 0
-    return round(f * fraction * bankroll, 2)
+# ==========================================
+# 4. ЛОГИКА АНАЛИЗА И СИГНАЛОВ
+# ==========================================
 
-# --- 4. ЯДРО АНАЛИЗА (ULTIMATE V3.0) ---
-
-def analyze_syndicate_logic(pin_data):
-    """Анализ '5 экранов': Тренд + Миграция маржи"""
+def run_universal_analysis(pin_data, market_data):
+    mode = pin_data['mode']
+    curr_r = pin_data['current']['r'][0] # R первого исхода
     trend = pin_data['move_pct']
-    payout_change = pin_data['payout_diff']
     
-    # 1. СМАРТ (True Smart)
-    # Цена падает (-), Маржа растет или стоит (+) -> Букмекер уверен, зазывает
-    if trend < -1.5 and payout_change > -0.15:
-        return "SMART", f"📉 Падение {trend:.1f}% подтверждено маржой"
+    status = "NEUTRAL"
+    msg = "Рынок спокоен."
+    color = "gray"
+    
+    # --- СЦЕНАРИИ СИНДИКАТА ---
+    
+    # 1. SMART MONEY (Идеальный вход)
+    # Цена падает (-1.5%), Риск растет (>0%)
+    if trend < -1.5 and curr_r > 0:
+        status = "💎 SMART MONEY"
+        color = "green"
+        msg = f"Истинный прогруз! Цена упала ({trend:.1f}%), а букмекер нагрузил риск (+{curr_r:.1f}%)."
         
-    # 2. ЗАЩИТА (Defensive)
-    # Цена падает (-), но Маржа тоже падает (-) -> Букмекер режет выплаты, боится
-    elif trend < -1.5 and payout_change < -0.2:
-        return "DEFENSIVE", f"🛡️ Падение {trend:.1f}%, но Payout упал (Защита)"
+    # 2. DEFENSIVE (Опасно)
+    # Цена падает, но Риск падает (Букмекер "прячется")
+    elif trend < -1.5 and curr_r < -2.0:
+        status = "🛡️ DEFENSIVE"
+        color = "orange"
+        msg = f"Цена упала, но букмекер снизил риск ({curr_r:.1f}%). Возможно, режут лимиты."
         
-    # 3. ФАЛЬШЬ/ЛОВУШКА
-    # Цена стоит, маржа скачет
-    elif abs(trend) < 1.0 and abs(payout_change) > 0.5:
-        return "NOISE", "⚠️ Шум. Странные движения маржи без тренда."
+    # 3. ANOMALY / TRAP
+    # Цена стоит, а Риск скачет
+    elif abs(trend) < 1.0 and abs(curr_r) > 10.0:
+        status = "⚠️ ANOMALY"
+        color = "red"
+        msg = "Цена стоит на месте, а Риск аномально скачет. Манипуляция?"
         
-    else:
-        return "NEUTRAL", "Без аномалий"
+    # 4. HUGE VALUE (Поиск ошибок без тренда)
+    elif abs(trend) < 1.0:
+        status = "🔎 SCANNING"
+        msg = "Тренда нет, ищем ошибки в линиях софтов..."
 
-def run_full_analysis(pin_data, market_data):
-    # 1. Базовые метрики
-    avg_asian_move = 0
-    if market_data['asians']:
-        avg_asian_move = np.mean([x['move_pct'] for x in market_data['asians']])
+    # --- ПОИСК ВАЛУЕВ У СОФТОВ ---
+    targets = []
     
-    # 2. Синдикатный сигнал (Pinnacle Deep Dive)
-    syn_signal, syn_reason = analyze_syndicate_logic(pin_data)
+    # Считаем Честную Цену (Fair Price)
+    current_odds = pin_data['current']['odds']
+    sum_imp = sum([1/k for k in current_odds])
     
-    # 3. Честная цена (Fair Price) - берем текущий кэф Пина и убираем маржу
-    # Текущий Payout у нас уже посчитан точно!
-    fair_prob = (1 / pin_data['current']['h']) * (pin_data['current']['payout'] / 100)
+    # Вероятность 1-го исхода без маржи
+    fair_prob = (1/current_odds[0]) / sum_imp
     fair_price = 1 / fair_prob
     
-    results = {
-        "grade": "C",
-        "color": "gray",
-        "title": "Нет сигнала",
-        "msg": "Рынок спокоен.",
-        "targets": []
-    }
-    
-    # 4. Поиск Валуя (Targets)
-    targets = []
-    for soft in market_data['softs']:
-        roi = (soft['current'] / fair_price) - 1
-        if roi > 0.02: # Валуй > 2%
-            stake = calculate_kelly(soft['current'], fair_prob, BANKROLL, KELLY_FRACTION)
+    for s in market_data['softs']:
+        roi = (s['odds'] / fair_price) - 1
+        if roi > 0.025: # Валуй > 2.5%
+            stake = calculate_kelly_stake(s['odds'], fair_prob, BANKROLL, KELLY_FRACTION)
             targets.append({
-                "name": soft['name'],
-                "odds": soft['current'],
-                "roi": round(roi * 100, 1),
+                "name": s['name'], 
+                "odds": s['odds'], 
+                "roi": roi*100, 
                 "stake": stake
             })
-    
-    # --- ИТОГОВОЕ РЕШЕНИЕ ---
-    
-    # S+ (Diamond): Smart-сигнал + Азиаты подтверждают + Есть валуй
-    if syn_signal == "SMART" and avg_asian_move < -1.0 and targets:
-        results["grade"] = "S+"
-        results["color"] = "green"
-        results["title"] = "💎 DIAMOND BET"
-        results["msg"] = f"Сильный синдикатный сигнал! {syn_reason}. Азиаты подтверждают."
-        results["targets"] = targets
-        
-    # A (Strong): Просто сильный валуй (даже без тренда) ИЛИ Smart без азиатов
-    elif targets:
-        best_roi = max([t['roi'] for t in targets])
-        if best_roi > 6.0:
-            results["grade"] = "A"
-            results["color"] = "green"
-            results["title"] = "🔥 HUGE VALUE"
-            results["msg"] = f"Найден огромный перевес {best_roi}%. Тренд не важен."
-            results["targets"] = targets
-        elif syn_signal == "SMART":
-            results["grade"] = "A-"
-            results["color"] = "green"
-            results["title"] = "SMART MOVE"
-            results["msg"] = "Пиннакл двигает линию умно, но азиаты молчат/нет данных."
-            results["targets"] = targets
-        else:
-            results["grade"] = "B"
-            results["color"] = "blue"
-            results["title"] = "MODERATE VALUE"
-            results["msg"] = "Есть математический перевес, но нет сильного движения рынка."
-            results["targets"] = targets
             
-    # B (Risky): Защитное движение
-    elif syn_signal == "DEFENSIVE" and targets:
-        results["grade"] = "B-"
-        results["color"] = "orange"
-        results["title"] = "DEFENSIVE / RISKY"
-        results["msg"] = "Пиннакл роняет кэф, но 'прячется' (режет маржу). Осторожно."
-        results["targets"] = targets
+    # Уточнение статуса, если нашли супер-валуй
+    if targets and status == "🔎 SCANNING":
+        best_roi = max([t['roi'] for t in targets])
+        if best_roi > 5.0:
+            status = "🔥 GAP VALUE"
+            color = "green"
+            msg = f"Найден огромный разрыв цен! Софты отстают на {best_roi:.1f}%."
+            
+    return status, msg, color, targets, curr_r, mode
 
-    return results, pin_data, avg_asian_move
+# ==========================================
+# 5. ИНТЕРФЕЙС (UI)
+# ==========================================
 
-# --- 5. ИНТЕРФЕЙС (UI) ---
+st.title("💎 Syndicate Odds Analyst")
+st.caption("Universal Engine v7.0 (Final)")
 
-st.title("👁️ Syndicate Odds Analyst v3.0")
-
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("1. История Pinnacle")
-    pin_input = st.text_area("Time / Home / Draw / Away...", height=200, placeholder="1.83 3.82 4.41 ... 26-11 23:58")
-with col2:
-    st.subheader("2. Рынок БК")
-    mkt_input = st.text_area("Bookie / Current / Open...", height=200, placeholder="Bet365\n2.05 ...\n1.76 ...")
+c1, c2 = st.columns(2)
+pin_txt = c1.text_area("1. Pinnacle History (Любой формат)", height=150, 
+                       placeholder="Вставь данные... (1X2 или Тоталы)\nПрограмма сама поймет формат.")
+mkt_txt = c2.text_area("2. Market Odds", height=150, 
+                       placeholder="Вставь список БК...\nBet365\n2.05...")
 
 if st.button("🚀 ЗАПУСТИТЬ АНАЛИЗ", type="primary", use_container_width=True):
-    if not pin_input or not mkt_input:
-        st.error("Заполни оба поля!")
-    else:
-        pin_data = parse_pinnacle_full(pin_input)
-        mkt_data = parse_market(mkt_input)
+    if pin_txt and mkt_txt:
+        pin = parse_pinnacle_universal(pin_txt)
+        mkt = parse_market_universal(mkt_txt)
         
-        if not pin_data:
-            st.error("❌ Ошибка парсинга Pinnacle. Проверь формат (должно быть 3 кэфа + время).")
-        else:
-            res, p_data, a_move = run_full_analysis(pin_data, mkt_data)
+        if pin:
+            status, msg, color, targets, r_val, mode = run_universal_analysis(pin, mkt)
             
             st.divider()
             
-            # ЗАГОЛОВОК РЕЗУЛЬТАТА
-            color_map = {"green": ":green", "blue": ":blue", "orange": ":orange", "gray": ":gray", "red": ":red"}
-            c_code = color_map.get(res['color'], ":gray")
-            st.header(f"{c_code}[ ГРЕЙД {res['grade']}: {res['title']} ]")
-            st.info(f"**Анализ:** {res['msg']}")
+            # --- ЗАГОЛОВОК ---
+            color_map = {"green": ":green", "orange": ":orange", "red": ":red", "gray": ":gray"}
+            target_name = "Home (П1)" if mode == "3way" else "Over (ТБ) / Фора 1"
             
-            # МЕТРИКИ
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Pinny Move", f"{p_data['move_pct']:+.2f}%")
-            m2.metric("Payout Change", f"{p_data['payout_diff']:+.2f}%", help="Миграция маржи. Если +, то букмекер уверен.")
-            m3.metric("Asian Move", f"{a_move:+.2f}%")
-            m4.metric("Fair Price", f"{1 / ((1/p_data['current']['h']) * (p_data['current']['payout']/100)):.2f}")
-
-            # ТАБЛИЦА СТАВОК
-            if res['targets']:
-                st.subheader("🎯 Точки входа (Targets)")
-                df = pd.DataFrame(res['targets'])
-                st.dataframe(
-                    df.style.format({"odds": "{:.2f}", "roi": "+{:.1f}%", "stake": "${:.0f}"}),
-                    use_container_width=True,
-                    column_config={
-                        "name": "Букмекер",
-                        "odds": "Кэф",
-                        "roi": "ROI (Валуй)",
-                        "stake": "Ставка (Kelly)"
-                    }
+            st.markdown(f"### Режим: **{mode.upper()}**. Цель анализа: **{target_name}**")
+            st.header(f"{color_map[color]}[ {status} ]")
+            st.info(f"**Вердикт:** {msg}")
+            
+            # --- РЕКОМЕНДАЦИИ ---
+            if targets:
+                st.subheader("📢 ЛУЧШИЕ ТОЧКИ ВХОДА")
+                # Сортируем по ROI
+                best_bet = sorted(targets, key=lambda x: x['roi'], reverse=True)[0]
+                
+                # КРАСИВАЯ КАРТОЧКА
+                st.success(
+                    f"🏆 **СТАВИТЬ НА:** {target_name}\n\n"
+                    f"🏦 **БК:** {best_bet['name']} @ {best_bet['odds']}\n\n"
+                    f"📈 **ВАЛУЙ:** +{best_bet['roi']:.1f}%\n\n"
+                    f"💵 **СУММА:** ${best_bet['stake']}"
                 )
+                
+                with st.expander("Показать все валуйные конторы"):
+                    df = pd.DataFrame(targets)
+                    st.dataframe(df.style.format({"odds": "{:.2f}", "roi": "+{:.1f}%", "stake": "${:.0f}"}))
             else:
-                if res['grade'] != "C":
-                    st.warning("Сигнал есть, но у Софт-букмекеров нет подходящих кэфов (Валуя нет).")
+                if status == "💎 SMART MONEY":
+                    st.warning("Тренд отличный, но Софты уже опустили кэфы. Валуя нет.")
+                else:
+                    st.write("Рекомендаций нет.")
+
+            st.divider()
+
+            # --- ГРАФИКИ ---
+            st.subheader("📊 Графики Синдиката")
             
-            # ДЕТАЛИ (Для профи)
-            with st.expander("🔬 Глубокие данные (Syndicate Data)"):
-                st.write(f"**Start Payout:** {p_data['open']['payout']:.2f}%")
-                st.write(f"**End Payout:** {p_data['current']['payout']:.2f}%")
-                st.write("**Full History:**")
-                st.write(p_data['history'])
+            chart_data = []
+            for row in pin['history']:
+                chart_data.append({
+                    "Время": row['time_str'],
+                    "Цена (Odds)": row['odds'][0],
+                    "Риск (R%)": row['r'][0]
+                })
+            df_chart = pd.DataFrame(chart_data).set_index("Время")
+            
+            g1, g2 = st.columns(2)
+            with g1:
+                st.write("**📉 ЦЕНА (Чем ниже, тем лучше)**")
+                st.line_chart(df_chart["Цена (Odds)"], color="#FF4B4B")
+            with g2:
+                st.write("**📈 РИСК R (Чем выше, тем увереннее)**")
+                st.line_chart(df_chart["Риск (R%)"], color="#00AA00")
+                
+        else:
+            st.error("❌ Не удалось распознать данные Pinnacle. Проверь, что копируешь.")
+    else:
+        st.warning("Пожалуйста, заполни оба поля данными.")
